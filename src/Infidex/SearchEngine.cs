@@ -122,7 +122,7 @@ public class SearchEngine : IDisposable
         // Setup word matcher (exact + LD1 + affix), mirroring original config 400 behavior
         if (wordMatcherSetup != null && tokenizerSetup != null)
         {
-            _wordMatcher = new WordMatcher.WordMatcher(wordMatcherSetup, tokenizerSetup.Delimiters);
+            _wordMatcher = new WordMatcher.WordMatcher(wordMatcherSetup, tokenizerSetup.Delimiters, textNormalizer);
         }
         
         _isIndexed = false;
@@ -267,6 +267,10 @@ public class SearchEngine : IDisposable
                 _vectorModel.BuildInvertedLists(cancellationToken: cancellationToken);
                 _isIndexed = true;
             }
+            
+            // Update term prefix trie for O(|prefix|) short query lookups.
+            // Called after every batch but is O(new terms) not O(all terms) for incremental updates.
+            _vectorModel.BuildTermPrefixTrie();
         }
         finally
         {
@@ -473,6 +477,12 @@ public class SearchEngine : IDisposable
         if (string.IsNullOrWhiteSpace(searchText))
             return [];
 
+        // Normalize searchText for accent-insensitive matching (same normalization as indexing)
+        if (_vectorModel.Tokenizer.TextNormalizer != null)
+        {
+            searchText = _vectorModel.Tokenizer.TextNormalizer.Normalize(searchText);
+        }
+
         if (EnableDebugLogging)
         {
             Console.WriteLine($"[DEBUG] Search start: normalized=\"{searchText}\", coverageDepth={coverageDepth}");
@@ -621,34 +631,27 @@ public class SearchEngine : IDisposable
                 }
                 
                 // TIERED STRATEGY (Fast to Slow):
-                // 1. EXACT PREFIX MATCH: Look up terms starting with prefix patterns (FAST, HIGH QUALITY)
+                // 1. EXACT PREFIX MATCH: Look up terms starting with prefix patterns using trie (O(|prefix| + k))
                 // 2. FUZZY FALLBACK: If not enough results, add terms containing query chars (SLOWER, LOWER QUALITY)
                 
                 int termsScanned = 0, exactMatched = 0, fuzzyMatched = 0;
                 Dictionary<long, int> docScores = new Dictionary<long, int>();
                 
-                // PHASE 1: Exact prefix matching (HIGH PRIORITY - score * 10)
-                foreach (var term in _vectorModel.TermCollection.GetAllTerms())
+                // PHASE 1: Exact prefix matching using trie (HIGH PRIORITY - score * 10)
+                // Complexity: O(|prefix| + k) where k is matching terms, vs O(n) linear scan
+                var trie = _vectorModel.TermPrefixTrie;
+                
+                foreach (string pattern in prefixPatterns)
                 {
-                    termsScanned++;
+                    IEnumerable<Term> matchingTerms = trie != null 
+                        ? trie.FindByPrefix(pattern) 
+                        : _vectorModel.TermCollection.GetAllTerms().Where(t => t.Text?.StartsWith(pattern) == true);
                     
-                    if (term.Text == null)
-                        continue;
-                    
-                    // Check if term starts with any of our prefix patterns
-                    bool exactMatch = false;
-                    foreach (string pattern in prefixPatterns)
+                    foreach (var term in matchingTerms)
                     {
-                        if (term.Text.StartsWith(pattern))
-                        {
-                            exactMatch = true;
-                            break;
-                        }
-                    }
-                    
-                    if (exactMatch)
-                    {
+                        termsScanned++;
                         exactMatched++;
+                        
                         var docIds = term.GetDocumentIds();
                         var weights = term.GetWeights();
                         
@@ -813,12 +816,19 @@ public class SearchEngine : IDisposable
                 // Build final score array with proper normalization and a clear
                 // precedence rule for short queries driven purely by lexical
                 // structure (no data-tuned weights).
-                // Precedence tiers:
+                //
+                // For single-token short queries, precedence is:
                 //   1) Title equals query (e.g., "IO" for "io")
                 //   2) First token equals query
-                //   3) Any token equals query
-                //   4) First token starts with query prefix
+                //   3) First token starts with query prefix
+                //   4) Any token equals query
                 //   5) Others, ranked by normalized docScores
+                //
+                // For multi-token short queries (all tokens too short for n‑grams),
+                // precedence is instead based on *token coverage*:
+                //   1) Documents containing all query tokens as full words
+                //   2) Documents containing at least one query token as a full word
+                //   3) Others, ranked by normalized docScores
                 // Find max score to normalize
                 int maxScore = 0;
                 foreach (var score in docScores.Values)
@@ -830,6 +840,8 @@ public class SearchEngine : IDisposable
                 // Normalize scores to 0-255 range, preserving relative differences,
                 // then add lexical precedence bits in the high byte.
                 char[] shortDelimiters = _vectorModel.Tokenizer.TokenizerSetup?.Delimiters ?? new[] { ' ' };
+                // Tokenize the query text once for multi-token coverage logic.
+                string[] queryTokensShort = searchLower.Split(shortDelimiters, StringSplitOptions.RemoveEmptyEntries);
                 
                 if (maxScore > 0)
                 {
@@ -846,41 +858,81 @@ public class SearchEngine : IDisposable
                         string trimmedTitle = titleLower.Trim();
                         string[] words = titleLower.Split(shortDelimiters, StringSplitOptions.RemoveEmptyEntries);
                         
-                        bool anyTokenExact = false;
-                        bool firstTokenExact = false;
-                        if (words.Length > 0)
+                        // Multi-token short query: prefer documents that cover more
+                        // of the query tokens as full words, independently of any
+                        // dataset specifics.
+                        int precedence = 0;
+                        if (queryTokensShort.Length >= 2)
                         {
-                            firstTokenExact = string.Equals(words[0], searchLower, StringComparison.Ordinal);
-                            if (firstTokenExact)
+                            int tokenMatches = 0;
+                            foreach (string qt in queryTokensShort)
                             {
-                                anyTokenExact = true;
-                            }
-                            else
-                            {
-                                for (int i = 0; i < words.Length; i++)
+                                if (words.Any(w => string.Equals(w, qt, StringComparison.Ordinal)))
                                 {
-                                    if (string.Equals(words[i], searchLower, StringComparison.Ordinal))
+                                    tokenMatches++;
+                                }
+                            }
+
+                            bool allTokensPresent = queryTokensShort.Length > 0 && tokenMatches == queryTokensShort.Length;
+                            if (allTokensPresent)
+                            {
+                                // All short query tokens present as words – strongest signal.
+                                precedence |= 8;
+
+                                // Within the full-coverage tier, prefer titles that are
+                                // lexically compact with respect to the query: the number
+                                // of tokens in the title is close to the number of query
+                                // tokens. This is a general, data-agnostic rule that
+                                // favors focused matches over noisy ones.
+                                if (words.Length <= queryTokensShort.Length + 1)
+                                {
+                                    precedence |= 2;
+                                }
+                            }
+                            else if (tokenMatches > 0)
+                            {
+                                // Partial coverage of query tokens.
+                                precedence |= 4;
+                            }
+                        }
+                        else
+                        {
+                            // Single-token short query behavior (IO, X, etc.)
+                            bool anyTokenExact = false;
+                            bool firstTokenExact = false;
+                            if (words.Length > 0)
+                            {
+                                firstTokenExact = string.Equals(words[0], searchLower, StringComparison.Ordinal);
+                                if (firstTokenExact)
+                                {
+                                    anyTokenExact = true;
+                                }
+                                else
+                                {
+                                    for (int i = 0; i < words.Length; i++)
                                     {
-                                        anyTokenExact = true;
-                                        break;
+                                        if (string.Equals(words[i], searchLower, StringComparison.Ordinal))
+                                        {
+                                            anyTokenExact = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
+                            
+                            bool titleEqualsQuery = string.Equals(trimmedTitle, searchLower, StringComparison.Ordinal);
+                            bool firstTokenStartsWithPrefix = firstTokenPrefixDocs.Contains(kvp.Key);
+                            
+                            // Bit layout (high to low importance) for single-token case:
+                            //  3: titleEqualsQuery
+                            //  2: firstTokenExact
+                            //  1: firstTokenStartsWithPrefix
+                            //  0: anyTokenExact (elsewhere in title)
+                            if (anyTokenExact) precedence |= 1;
+                            if (firstTokenStartsWithPrefix) precedence |= 2;
+                            if (firstTokenExact) precedence |= 4;
+                            if (titleEqualsQuery) precedence |= 8;
                         }
-                        
-                        bool titleEqualsQuery = string.Equals(trimmedTitle, searchLower, StringComparison.Ordinal);
-                        bool firstTokenStartsWithPrefix = firstTokenPrefixDocs.Contains(kvp.Key);
-                        
-                        int precedence = 0;
-                        // Bit layout (high to low importance):
-                        //  3: titleEqualsQuery
-                        //  2: firstTokenExact
-                        //  1: firstTokenStartsWithPrefix
-                        //  0: anyTokenExact (elsewhere in title)
-                        if (anyTokenExact) precedence |= 1;
-                        if (firstTokenStartsWithPrefix) precedence |= 2;
-                        if (firstTokenExact) precedence |= 4;
-                        if (titleEqualsQuery) precedence |= 8;
                         
                         ushort finalScore = (ushort)((precedence << 8) | normalizedScore);
 
@@ -952,7 +1004,8 @@ public class SearchEngine : IDisposable
                 {
                     tfidfQuery = searchText;
                 }
-                relevancyScores = _vectorModel.Search(tfidfQuery, bestSegments, queryIndex: 0);
+                // Use MaxScore algorithm with coverageDepth as K for early termination
+                relevancyScores = _vectorModel.SearchWithMaxScore(tfidfQuery, coverageDepth, bestSegments, queryIndex: 0);
             }
 
             if (perfStopwatch != null)
@@ -966,7 +1019,8 @@ public class SearchEngine : IDisposable
                 Console.WriteLine($"[DEBUG] Stage1 TF-IDF: {tfidfAll.Length} candidates");
                 foreach (ScoreEntry e in tfidfAll)
                 {
-                    Console.WriteLine($"  [DEBUG]   TF-IDF docKey={e.DocumentId}, score={e.Score}");
+                    // disabled - long outputs
+                    // Console.WriteLine($"  [DEBUG]   TF-IDF docKey={e.DocumentId}, score={e.Score}");
                 }
             }
             
@@ -997,7 +1051,8 @@ public class SearchEngine : IDisposable
                 Console.WriteLine($"[DEBUG] Stage2 Coverage: depth={coverageDepth}, top TF-IDF candidates (after prescreen={coverageSetup?.EnableLexicalPrescreen == true}):");
                 foreach (ScoreEntry c in topCandidates)
                 {
-                    Console.WriteLine($"  [DEBUG]   top TF-IDF docKey={c.DocumentId}, score={c.Score}");
+                    // disabled - long outputs
+                    //Console.WriteLine($"  [DEBUG]   top TF-IDF docKey={c.DocumentId}, score={c.Score}");
                 }
             }
 
@@ -1048,8 +1103,33 @@ public class SearchEngine : IDisposable
                     int maxWordHits = 0;
 
                     // --- Coverage for WordMatcher hits (isFromWordMatcher = true) ---
+                    // OPTIMIZATION: Limit WordMatcher processing to avoid O(n) coverage on thousands of docs.
+                    // Prioritize WordMatcher candidates that ALSO appear in TF-IDF top-K (highest relevance).
+                    // For candidates only in WordMatcher, process up to coverageDepth.
+                    HashSet<int> tfidfInternalIds = new HashSet<int>();
+                    foreach (ScoreEntry candidate in topCandidates)
+                    {
+                        Document? tDoc = _vectorModel.Documents.GetDocumentByPublicKey(candidate.DocumentId);
+                        if (tDoc != null) tfidfInternalIds.Add(tDoc.Id);
+                    }
+                    
+                    // Split WordMatcher candidates into overlapping (high priority) and unique
+                    List<int> wmOverlapping = new List<int>();
+                    List<int> wmUnique = new List<int>();
+                    foreach (int id in wordMatcherInternalIds)
+                    {
+                        if (tfidfInternalIds.Contains(id))
+                            wmOverlapping.Add(id);
+                        else
+                            wmUnique.Add(id);
+                    }
+                    
+                    // Process all overlapping, then up to (coverageDepth - overlap) unique
+                    int wmLimit = Math.Max(0, coverageDepth - wmOverlapping.Count);
+                    var wmToProcess = wmOverlapping.Concat(wmUnique.Take(wmLimit)).ToList();
+                    
                     long wmCoverageStart = perfStopwatch?.ElapsedMilliseconds ?? 0;
-                    foreach (int internalId in wordMatcherInternalIds)
+                    foreach (int internalId in wmToProcess)
                     {
                         Document? doc = _vectorModel.Documents.GetDocument(internalId);
                         if (doc == null || doc.Deleted)
@@ -1345,6 +1425,21 @@ public class SearchEngine : IDisposable
                                     queryTokensLex[1].Length < (_coverageSetup?.MinWordSize ?? 2);
         bool hasBigramPrefix = false;
         bool strictShortBigram = false;
+        // First lexical token as an \"intent\" anchor for multi-term queries.
+        // If this token is reasonably specific (len >= 4) and appears as a
+        // substring in the document text, we treat that as a strong signal
+        // of user intent (e.g. \"scio\" in \"ScioŠkola Zlín\") even when
+        // common tail phrases like \"škola ve Zlíně\" match other documents
+        // better. This is purely lexical and does not use any rarity/IDF.
+        bool firstAnchorTokenHit = false;
+        if (!isSingleTermQuery && rawQueryTerms > 0 && queryTokensLex[0].Length >= 4)
+        {
+            string firstToken = queryTokensLex[0];
+            if (documentText.IndexOf(firstToken, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                firstAnchorTokenHit = true;
+            }
+        }
         if (rawQueryTerms >= 2 && docTokensLex.Length >= 2)
         {
             string q0 = queryTokensLex[0];
@@ -1441,8 +1536,19 @@ public class SearchEngine : IDisposable
             else
             {
                 // General multi-term behavior:
-                // Bit 5: Lexical perfect document – strongest general signal.
-                if (useLexicalPerfectDoc)
+                // Bit 5: Strong title-level intent signal.
+                //   - Prefer lexically \"perfect\" documents where every title
+                //     token is explained by some query token.
+                //   - Additionally, if the first query token is reasonably
+                //     specific (len >= 4) and appears as a substring in the
+                //     document text (e.g. \"scio\" in \"ScioŠkola Zlín\"), we
+                //     treat that as an equally strong signal of user intent,
+                //     but only when there is evidence of a phrase with at
+                //     least two matched tokens (LongestPrefixRun >= 2).
+                //     This prevents documents that match only the first word
+                //     (e.g. \"tyršovka\" without \"Česká Lípa\") from outranking
+                //     more complete matches.
+                if (useLexicalPerfectDoc || (firstAnchorTokenHit && longestRun >= 2))
                 {
                     precedence |= 32;
                 }
@@ -1488,7 +1594,32 @@ public class SearchEngine : IDisposable
             ? features.SumCi / features.TermsCount
             : 0f;
         float semantic;
-        if (isSingleTermQuery || features.DocTokenCount == 0)
+        if (isSingleTermQuery)
+        {
+            // For single-term queries we augment the per-term coverage signal
+            // with a lexical similarity measure that captures how well the
+            // (possibly joined) query suffix aligns with individual document
+            // tokens. This is crucial for cases like:
+            //   - "sciozlí"  vs  "ScioŠkola Zlín" / "ScioŠkola Kolín"
+            //   - "sciozlínskáškola" vs the same titles
+            //
+            // The idea:
+            //   1) If a document token occurs as a full substring inside the
+            //      query, score it by how much of the query it covers and how
+            //      early it appears (earlier substrings are more intentful).
+            //   2) Otherwise, look for the longest prefix of the token that
+            //      matches the *suffix* of the query (captures cases like
+            //      "sciozlí" ending with "zlí" vs "Zlín").
+            //
+            // We combine coverage and lexical similarity so that documents
+            // with identical coverage can still be ordered by how well their
+            // tokens align with the query string.
+            // The blend is purely lexical (no document-frequency/rarity):
+            //   semantic = 0.5 * avgCi + 0.5 * lexicalSim
+            float lexicalSim = ComputeSingleTermLexicalSimilarity(queryText, docTokensLex);
+            semantic = 0.5f * avgCi + 0.5f * lexicalSim;
+        }
+        else if (features.DocTokenCount == 0)
         {
             semantic = avgCi;
         }
@@ -1498,11 +1629,191 @@ public class SearchEngine : IDisposable
                 ? (float)features.WordHits / features.DocTokenCount
                 : 0f;
             semantic = avgCi * docCoverage;
+
+            // For longer, multi-term queries (3+ tokens), apply a small,
+            // purely lexical intent bonus based on whether the document
+            // simultaneously matches the first query token (as a stem prefix)
+            // prefix of some title token) and the trailing phrase (captured
+            // by a strong suffix run). This helps cases like
+            //   - "tyršovka česká lípa"
+            //     where the intended school has both a Tyrš-* token and a
+            //     clean "Česká Lípa" suffix, without using any rarity/IDF.
+            if (rawQueryTerms >= 3 && docTokensLex.Length > 0)
+            {
+                bool hasSuffixPair = features.SuffixPrefixRun >= 2;
+                bool hasFirstStem = false;
+
+                string firstToken = queryTokensLex[0];
+                const int AnchorStemLength = 3;
+                if (firstToken.Length >= AnchorStemLength)
+                {
+                    string stem = firstToken[..AnchorStemLength];
+                    for (int i = 0; i < docTokensLex.Length; i++)
+                    {
+                        string t = docTokensLex[i];
+                        if (!string.IsNullOrEmpty(t) &&
+                            t.Length >= stem.Length &&
+                            t.StartsWith(stem, StringComparison.OrdinalIgnoreCase))
+                        {
+                            hasFirstStem = true;
+                            break;
+                        }
+                    }
+                }
+
+                int intentTier = 0;
+                if (hasFirstStem && hasSuffixPair)
+                    intentTier = 2;
+                else if (hasFirstStem || hasSuffixPair)
+                    intentTier = 1;
+
+                if (intentTier > 0)
+                {
+                    float bonus = 0.15f * intentTier;
+                    semantic = MathF.Min(1f, semantic + bonus);
+                }
+            }
         }
         
         byte semanticScore = (byte)Math.Clamp(semantic * 255f, 0, 255);
         
         return (ushort)((precedence << 8) | semanticScore);
+    }
+    
+    /// <summary>
+    /// Computes a lexical similarity signal for single-term queries by
+    /// comparing the query string against individual document tokens.
+    /// 
+    /// Design:
+    /// - If a document token T appears as a full substring of the query Q,
+    ///   we score it by (|T| / |Q|) * (1 - startIndex(Q,T)/|Q|). This favors
+    ///   longer substrings that appear earlier in the query.
+    /// - Otherwise we look for:
+    ///     (a) the longest prefix of T that matches the suffix of Q
+    ///     (b) a small-edit-distance alignment between Q and T (LD ≤ 2)
+    ///   and score the best of these as len / |Q|. This captures cases
+    ///   like "sciozli" vs "Zlín" and "shwashan" vs "Shawshank" while
+    ///   remaining purely lexical (no collection statistics).
+    /// </summary>
+    private static float ComputeSingleTermLexicalSimilarity(string queryText, string[] docTokensLex)
+    {
+        if (string.IsNullOrEmpty(queryText) || docTokensLex.Length == 0)
+            return 0f;
+
+        // Ignore very short single-term queries ("a", "th", etc.) – these are
+        // already handled by the dedicated short-query pipeline.
+        string q = queryText.ToLowerInvariant();
+        int qLen = q.Length;
+        if (qLen < 3)
+            return 0f;
+
+        float best = 0f;
+
+        foreach (string token in docTokensLex)
+        {
+            if (string.IsNullOrWhiteSpace(token))
+                continue;
+
+            string t = token.ToLowerInvariant();
+            if (t.Length < 2)
+                continue;
+
+            // 1) Full substring case: token appears inside the query.
+            int idx = q.IndexOf(t, StringComparison.Ordinal);
+            if (idx >= 0)
+            {
+                float lenFrac = (float)t.Length / qLen;
+                float positionFactor = 1f - (float)idx / qLen;
+                float score = lenFrac * positionFactor;
+                if (score > best)
+                    best = score;
+                continue;
+            }
+
+            // 2a) Longest prefix of token that matches suffix of query.
+            int maxK = Math.Min(qLen, t.Length);
+            int bestK = 0;
+            for (int len = maxK; len >= 2; len--)
+            {
+                if (q.AsSpan(qLen - len).Equals(t.AsSpan(0, len), StringComparison.Ordinal))
+                {
+                    bestK = len;
+                    break;
+                }
+            }
+
+            float prefixSuffixScore = bestK > 0 ? (float)bestK / qLen : 0f;
+
+            // 2b) Small-edit-distance alignment between full query and token
+            //     using Damerau-Levenshtein (transpositions allowed).
+            //     We clamp maxEdits to 2 to keep this cheap and focused.
+            float fuzzyScore = 0f;
+            int maxEdits = 2;
+            int dist = LevenshteinDistance.CalculateDamerau(q, t, maxEdits, ignoreCase: true);
+            if (dist <= maxEdits)
+            {
+                fuzzyScore = (float)(qLen - dist) / qLen;
+            }
+
+            float combined = MathF.Max(prefixSuffixScore, fuzzyScore);
+            if (combined > best)
+                best = combined;
+        }
+
+        // Two-segment coverage: detect documents that simultaneously explain
+        // both a prefix and a suffix fragment of the query (e.g. two words
+        // joined together). We require room for at least two disjoint
+        // fragments of minimum length L >= 3, which implies |Q| >= 2L.
+        const int MinSegmentLength = 3;
+        if (qLen >= 2 * MinSegmentLength)
+        {
+            int segLen = Math.Min(2 * MinSegmentLength, qLen / 2);
+            string prefixFrag = q[..segLen];
+            string suffixFrag = q.Substring(qLen - segLen, segLen);
+
+            int prefixIndex = -1;
+            int suffixIndex = -1;
+
+            for (int i = 0; i < docTokensLex.Length; i++)
+            {
+                string token = docTokensLex[i];
+                if (string.IsNullOrWhiteSpace(token))
+                    continue;
+
+                string t = token.ToLowerInvariant();
+                if (t.Length < 3)
+                    continue;
+
+                if (prefixIndex == -1 &&
+                    (t.StartsWith(prefixFrag, StringComparison.Ordinal) ||
+                     prefixFrag.StartsWith(t, StringComparison.Ordinal)))
+                {
+                    prefixIndex = i;
+                }
+
+                if (suffixIndex == -1 &&
+                    (t.EndsWith(suffixFrag, StringComparison.Ordinal) ||
+                     suffixFrag.EndsWith(t, StringComparison.Ordinal)))
+                {
+                    suffixIndex = i;
+                }
+
+                if (prefixIndex != -1 && suffixIndex != -1)
+                    break;
+            }
+
+            // Require that prefix and suffix evidence come from (possibly)
+            // different tokens, so that we truly capture two-part coverage
+            // like "scio" + "zlín" rather than a single word.
+            if (prefixIndex != -1 && suffixIndex != -1 && prefixIndex != suffixIndex)
+            {
+                float twoSegScore = MathF.Min(1f, (prefixFrag.Length + suffixFrag.Length) / (float)qLen);
+                if (twoSegScore > best)
+                    best = twoSegScore;
+            }
+        }
+
+        return best;
     }
     
     
@@ -1515,10 +1826,16 @@ public class SearchEngine : IDisposable
         HashSet<int> result = [];
 
         if (_wordMatcher == null)
+        {
+            if (EnableDebugLogging)
+                Console.WriteLine("[DEBUG] WordMatcher is null!");
             return result;
+        }
 
         // Exact + LD1 matches
         HashSet<int> ids = _wordMatcher.Lookup(queryText, filter: null);
+        if (EnableDebugLogging)
+            Console.WriteLine($"[DEBUG] WordMatcher Lookup('{queryText}'): {ids.Count} exact/LD1 matches");
         foreach (int id in ids)
         {
             result.Add(id);
@@ -1528,12 +1845,20 @@ public class SearchEngine : IDisposable
         if (_coverageSetup != null && _coverageSetup.CoverPrefixSuffix)
         {
             HashSet<int> affixIds = _wordMatcher.LookupAffix(queryText, filter: null);
+            if (EnableDebugLogging)
+                Console.WriteLine($"[DEBUG] WordMatcher LookupAffix('{queryText}'): {affixIds.Count} affix matches");
             foreach (int id in affixIds)
             {
                 result.Add(id);
             }
         }
+        else if (EnableDebugLogging)
+        {
+            Console.WriteLine($"[DEBUG] Affix lookup disabled (CoverPrefixSuffix={_coverageSetup?.CoverPrefixSuffix})");
+        }
 
+        if (EnableDebugLogging)
+            Console.WriteLine($"[DEBUG] WordMatcher total: {result.Count} matches");
         return result;
     }
     
@@ -1576,7 +1901,13 @@ public class SearchEngine : IDisposable
             if (doc == null || doc.Deleted)
                 continue;
 
+            // Normalize text for accent-insensitive comparison
             string text = doc.IndexedText;
+            if (_vectorModel.Tokenizer.TextNormalizer != null)
+            {
+                text = _vectorModel.Tokenizer.TextNormalizer.Normalize(text);
+            }
+            
             bool hasAnyToken = false;
 
             foreach (string token in queryTokens)
@@ -1663,6 +1994,12 @@ public class SearchEngine : IDisposable
                     }
                 }
             }
+        }
+
+        // Normalize for accent-insensitive coverage comparisons
+        if (_vectorModel.Tokenizer.TextNormalizer != null)
+        {
+            docText = _vectorModel.Tokenizer.TextNormalizer.Normalize(docText);
         }
 
         return docText;
@@ -1994,7 +2331,7 @@ public class SearchEngine : IDisposable
             
         VectorModel vectorModel = new VectorModel(tokenizer, stopTermLimit, fieldWeights);
         
-        SearchEngine engine = new SearchEngine(vectorModel, enableCoverage, coverageSetup, tokenizerSetup, wordMatcherSetup);
+        SearchEngine engine = new SearchEngine(vectorModel, enableCoverage, coverageSetup, tokenizerSetup, wordMatcherSetup, textNormalizer);
         
         using (FileStream stream = File.OpenRead(filePath))
         using (BinaryReader reader = new BinaryReader(stream))
@@ -2049,7 +2386,8 @@ public class SearchEngine : IDisposable
         bool enableCoverage,
         CoverageSetup? coverageSetup,
         TokenizerSetup? tokenizerSetup,
-        WordMatcherSetup? wordMatcherSetup)
+        WordMatcherSetup? wordMatcherSetup,
+        TextNormalizer? textNormalizer = null)
     {
         _vectorModel = vectorModel;
         _isIndexed = true; // Loaded index is assumed to be calculated
@@ -2063,7 +2401,7 @@ public class SearchEngine : IDisposable
         
         if (wordMatcherSetup != null && tokenizerSetup != null)
         {
-            _wordMatcher = new WordMatcher.WordMatcher(wordMatcherSetup, tokenizerSetup.Delimiters);
+            _wordMatcher = new WordMatcher.WordMatcher(wordMatcherSetup, tokenizerSetup.Delimiters, textNormalizer);
             // WordMatcher population is now handled by the Load method (either loading from disk or rebuilding)
         }
     }
