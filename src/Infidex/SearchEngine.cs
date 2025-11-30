@@ -180,6 +180,7 @@ public class SearchEngine : IDisposable
                 _coverageEngine.SetWordIdfCache(_vectorModel.WordIdfCache);
             }
 
+            _wordMatcher?.FinalizeIndex();
             _isIndexed = true;
             _vectorModel.BuildOptimizedIndexes();
         }
@@ -227,6 +228,7 @@ public class SearchEngine : IDisposable
         {
             Status = SearchEngineStatus.Indexing;
             _vectorModel.CalculateWeights();
+            _wordMatcher?.FinalizeIndex();
             _isIndexed = true;
             Status = SearchEngineStatus.Ready;
         }
@@ -243,6 +245,7 @@ public class SearchEngine : IDisposable
                 Status = SearchEngineStatus.Indexing;
                 ct.ThrowIfCancellationRequested();
                 _vectorModel.BuildInvertedLists(cancellationToken: ct);
+                _wordMatcher?.FinalizeIndex();
                 _isIndexed = true;
                 Status = SearchEngineStatus.Ready;
             }
